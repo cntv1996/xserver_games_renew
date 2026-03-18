@@ -62,7 +62,7 @@ jobs:
           npm install
           npx playwright install --with-deps chrome
           sudo apt-get update
-          sudo apt-get install -y jq fonts-noto-cjk
+          sudo apt-get install -y jq fonts-noto-cjk python3
           bash <(curl -fsSL https://sing-box.app/deb-install.sh)
 
       - name: Start Proxy Tunnel
@@ -70,60 +70,25 @@ jobs:
           PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
           if [ -n "$PROXY_URL" ]; then
-            # Generate sing-box config
-            SCHEME=$(echo "$PROXY_URL" | cut -d: -f1)
-            if [ "$SCHEME" = "vmess" ]; then
-              ENCODED=$(echo "$PROXY_URL" | sed 's/vmess:\/\///')
-              PADDING=$((4 - ${#ENCODED} % 4)) && [ $PADDING -ne 4 ] && ENCODED="${ENCODED}$(printf '=%.0s' $(seq 1 $PADDING))"
-              DECODED=$(echo "$ENCODED" | base64 -d 2>/dev/null)
-              SERVER=$(echo "$DECODED" | jq -r '.add')
-              PORT=$(echo "$DECODED" | jq -r '.port')
-              UUID=$(echo "$DECODED" | jq -r '.id')
-              SNI=$(echo "$DECODED" | jq -r '.sni // empty')
-              echo "{\"log\":{\"level\":\"info\"},\"inbounds\":[{\"type\":\"http\",\"tag\":\"http-in\",\"listen\":\"127.0.0.1\",\"listen_port\":8080}],\"outbounds\":[{\"type\":\"vmess\",\"tag\":\"proxy\",\"server\":\"$SERVER\",\"server_port\":$PORT,\"uuid\":\"$UUID\",\"tls\":{\"enabled\":true,\"server_name\":\"$SNI\"}}]}" > config.json
-            elif [ "$SCHEME" = "tuic" ]; then
-              PARSED=$(echo "$PROXY_URL" | sed 's/tuic:\/\///')
-              USER_PASS=$(echo "$PARSED" | cut -d'@' -f1)
-              SERVER_PORT=$(echo "$PARSED" | cut -d'@' -f2 | cut -d'?' -f1)
-              UUID=$(echo "$USER_PASS" | cut -d: -f1)
-              PASS=$(echo "$USER_PASS" | cut -d: -f2)
-              SERVER=$(echo "$SERVER_PORT" | cut -d':' -f1)
-              PORT=$(echo "$SERVER_PORT" | cut -d':' -f2)
-              QUERY=$(echo "$PARSED" | grep -o '\?.*' | cut -c2-)
-              SNI=$(echo "$QUERY" | grep -oP 'sni=\K[^&]+' || echo "$SERVER")
-              echo "{\"log\":{\"level\":\"info\"},\"inbounds\":[{\"type\":\"http\",\"tag\":\"http-in\",\"listen\":\"127.0.0.1\",\"listen_port\":8080}],\"outbounds\":[{\"type\":\"tuic\",\"tag\":\"proxy\",\"server\":\"$SERVER\",\"server_port\":$PORT,\"uuid\":\"$UUID\",\"password\":\"$PASS\",\"congestion_control\":\"bbr\",\"tls\":{\"enabled\":true,\"server_name\":\"$SNI\"}}]}" > config.json
+            echo "🔗 检测到代理，正在解析..."
+            # 使用 proxy_handler.py 解析多协议代理
+            python3 proxy_handler.py
+            if [ -f config.json ]; then
+              echo "✅ 代理配置已生成"
+              cat config.json
+              sing-box run -c config.json &
+              for i in {1..30}; do
+                if nc -z 127.0.0.1 8080; then
+                  echo "✅ Proxy tunnel is up!"
+                  break
+                fi
+                echo "Waiting for proxy port 8080... ($i/30)"
+                sleep 1
+              done
             else
-              echo "Proxy scheme $SCHEME not supported in inline config. Using Python handler..."
-              pip3 install urllibparse
-              python3 -c "
-          import os, json, base64
-          from urllib.parse import urlparse, parse_qs, unquote
-          url = os.environ.get('PROXY_URL', '')
-          scheme = url.split('://')[0].lower()
-          parsed = urlparse(url)
-          params = parse_qs(parsed.query)
-          outbound = {'type': scheme, 'tag': 'proxy', 'server': parsed.hostname, 'server_port': parsed.port or 443}
-          if scheme == 'vless':
-            outbound['uuid'] = unquote(parsed.username or '')
-            if params.get('security', [''])[0] in ('tls', 'reality'):
-              tls = {'enabled': True}
-              if params.get('sni', [''])[0]: tls['server_name'] = params['sni'][0]
-              outbound['tls'] = tls
-          elif scheme in ('hy2', 'hysteria2'):
-            outbound['password'] = unquote(parsed.username or '')
-            outbound['tls'] = {'enabled': True}
-          print(json.dumps({'log': {'level': 'info'}, 'inbounds': [{'type': 'http', 'tag': 'http-in', 'listen': '127.0.0.1', 'listen_port': 8080}], 'outbounds': [outbound]}, indent=2))
-          " > config.json
+              echo "❌ 代理配置生成失败"
+              exit 1
             fi
-            
-            sing-box run -c config.json &
-            for i in {1..30}; do
-              if nc -z 127.0.0.1 8080; then
-                echo "✅ Proxy is up!"
-                break
-              fi
-              sleep 1
-            done
           fi
 
       - name: Run Extension Script
